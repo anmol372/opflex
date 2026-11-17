@@ -21,11 +21,28 @@ DOCKER_DIR=docker/travis
 OPFLEX_DIR=.
 export OPFLEX_DIR
 
-# Check if the tag contains "opflex-build-base"
-if [[ "${TRAVIS_TAG}" == *"opflex-build-base"* ]]; then
-  BUILD_BASE=true
+# Determine build phase: prioritize GHA_OPFLEX_BUILD_PHASE if set, otherwise use TRAVIS_TAG parsing
+if [[ -n "${GHA_OPFLEX_BUILD_PHASE:-}" ]]; then
+  # GitHub Actions build: explicit phase passed as environment variable
+  case "${GHA_OPFLEX_BUILD_PHASE}" in
+    base)
+      BUILD_BASE=true
+      ;;
+    runtime)
+      BUILD_BASE=false
+      ;;
+    *)
+      echo "ERROR: GHA_OPFLEX_BUILD_PHASE must be 'base' or 'runtime', got '${GHA_OPFLEX_BUILD_PHASE}'" >&2
+      exit 1
+      ;;
+  esac
 else
-  BUILD_BASE=false
+  # Travis CI build: derive phase from tag name
+  if [[ "${TRAVIS_TAG}" == *"opflex-build-base"* ]]; then
+    BUILD_BASE=true
+  else
+    BUILD_BASE=false
+  fi
 fi
 
 set -Eeuxo pipefail
@@ -44,9 +61,9 @@ else
     PREPARED_RUNTIME_INPUT=false
     BASE_IMAGE_REF="$DOCKER_HUB_ID/opflex-build-base:$DOCKER_TAG"
     if [[ "${GITHUB_ACTIONS:-false}" == "true" && "${CI_EVIDENCE_MODE:-}" == "prepared-v1" ]]; then
-      # Validate this new runtime contract without changing legacy phase dispatch.
+      # Prepared builds must use an explicit phase and immutable base input.
       [[ "${GHA_OPFLEX_BUILD_PHASE:-}" == runtime ]] || {
-        echo "Prepared runtime input requires the runtime phase; the parent phase fix is required" >&2
+        echo "Prepared runtime input requires the runtime phase" >&2
         exit 1
       }
       [[ "${EXPECTED_OPFLEX_BASE_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
@@ -63,17 +80,23 @@ else
       PREPARED_RUNTIME_INPUT=true
     fi
     docker pull "${BASE_IMAGE_REF}"
-    if [[ "${PREPARED_RUNTIME_INPUT}" == true ]]; then
-      ACTUAL_BASE_REPODIGEST=$(docker image inspect \
-        --format='{{index .RepoDigests 0}}' "${BASE_IMAGE_REF}")
-      ACTUAL_BASE_DIGEST="${ACTUAL_BASE_REPODIGEST##*@}"
-      [[ "${ACTUAL_BASE_DIGEST}" == "${EXPECTED_OPFLEX_BASE_DIGEST}" ]] || {
-        echo "Pulled base digest differs from the approved input" >&2
-        exit 1
+    if [[ "${PREPARED_RUNTIME_INPUT}" == true || "${GHA_OPFLEX_BUILD_PHASE:-}" == runtime ]]; then
+      [[ "${EXPECTED_OPFLEX_BASE_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "Invalid expected opflex-build-base digest" >&2; exit 1;
       }
-      printf 'opflex_build_base_ref=%s\nopflex_build_base_digest=%s\n' \
-        "${BASE_IMAGE_REF}" "${ACTUAL_BASE_DIGEST}" \
-        > "${CI_ARTIFACT_DIR}/opflex-build-base-input.txt"
+      ACTUAL_BASE_DIGEST="$(docker image inspect \
+        --format='{{range .RepoDigests}}{{println .}}{{end}}' "${BASE_IMAGE_REF}" \
+        | awk -v prefix="${DOCKER_HUB_ID}/opflex-build-base@" \
+          'index($0, prefix) == 1 {print substr($0, length(prefix) + 1)}')"
+      [[ "${ACTUAL_BASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ && \
+         "${ACTUAL_BASE_DIGEST}" == "${EXPECTED_OPFLEX_BASE_DIGEST}" ]] || {
+        echo "Pulled base digest differs from the approved input" >&2; exit 1;
+      }
+      if [[ "${PREPARED_RUNTIME_INPUT}" == true ]]; then
+        printf 'opflex_build_base_ref=%s\nopflex_build_base_digest=%s\n' \
+          "${BASE_IMAGE_REF}" "${ACTUAL_BASE_DIGEST}" \
+          > "${CI_ARTIFACT_DIR}/opflex-build-base-input.txt"
+      fi
     fi
 
     pushd $OPFLEX_DIR/genie

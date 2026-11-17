@@ -11,9 +11,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-AUTHOR_PHASE_FIXED = False
 A = 'sha256:' + 'a' * 64
 B = 'sha256:' + 'b' * 64
 HUB = 'quay.io/noirolabs'
@@ -46,7 +46,7 @@ if name == 'docker':
                 break
     record(**data)
     if args[:2] == ['image', 'inspect']:
-        print(os.environ['FIXTURE_HUB'] + '/opflex-build-base@' + os.environ['FIXTURE_ACTUAL_DIGEST'])
+        print(os.environ.get('FIXTURE_REPODIGESTS', os.environ['FIXTURE_HUB'] + '/opflex-build-base@' + os.environ['FIXTURE_ACTUAL_DIGEST']))
     elif args and args[0] == 'create': print('fixture-container')
 elif name == 'mvn': record(argv=args)
 elif name == 'tar':
@@ -149,19 +149,37 @@ class ApprovedBaseInput(unittest.TestCase):
         self.invoke(expected=1)
         self.assertEqual(self.commands(),[])
 
-    def test_base_phase_preserves_author_fix_or_remains_explicit_default_blocker(self):
+    def test_base_phase_builds_base_without_maven_or_runtime_digest(self):
         self.env['GHA_OPFLEX_BUILD_PHASE']='base'
         self.env.pop('EXPECTED_OPFLEX_BASE_DIGEST')
-        result=self.invoke(expected=0 if AUTHOR_PHASE_FIXED else 1)
+        self.invoke()
         calls=self.commands()
-        if AUTHOR_PHASE_FIXED:
-            builds=[item for item in calls if item['tool']=='docker' and item['argv'][0]=='build']
-            self.assertEqual(len(builds),1)
-            self.assertTrue(builds[0]['argv'][builds[0]['argv'].index('-f')+1].endswith('/Dockerfile-opflex-build-base'))
-            self.assertFalse(any(item['tool']=='mvn' for item in calls))
-        else:
-            self.assertIn('parent phase fix is required',result.stderr)
-            self.assertEqual(calls,[])
+        builds=[item for item in calls if item['tool']=='docker' and item['argv'][0]=='build']
+        self.assertEqual(len(builds),1)
+        self.assertTrue(builds[0]['argv'][builds[0]['argv'].index('-f')+1].endswith('/Dockerfile-opflex-build-base'))
+        self.assertFalse(any(item['tool']=='mvn' for item in calls))
+
+    def test_runtime_selects_matching_repository_digest_after_unrelated_cached_entry(self):
+        self.env['FIXTURE_REPODIGESTS']='example.test/cached/base@'+B+'\n'+HUB+'/opflex-build-base@'+A
+        self.invoke()
+        self.assertEqual(self.image_build()['resolved_base_digest'], A)
+
+    def test_runtime_rejects_digest_from_only_an_unrelated_repository(self):
+        self.env['FIXTURE_REPODIGESTS']='example.test/cached/base@'+A
+        self.invoke(expected=1)
+        self.assertFalse(any(item['tool']=='mvn' for item in self.commands()))
+
+    def test_actual_workflow_base_handoff_selects_repository_not_first_digest(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/opflex-images.yml').read_text())
+        step=next(step for step in workflow['jobs']['build-base']['steps'] if step.get('id')=='publish')
+        cicd=self.directory/'cicd/travis';cicd.mkdir(parents=True)
+        helper=cicd/'build-push-opflex-images.sh';helper.write_text('#!/bin/bash\nexit 0\n');helper.chmod(0o755)
+        output=self.directory/'workflow-output'
+        env={**self.env,'CICD_DIR':str(cicd.parent),'GITHUB_OUTPUT':str(output),'UPSTREAM_ID':'81c2369',
+             'FIXTURE_REPODIGESTS':'example.test/cached/base@'+B+'\n'+HUB+'/opflex-build-base@'+A}
+        result=subprocess.run(['bash','-c',step['run']],cwd=self.repo,env=env,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('quay_digest='+A,output.read_text())
 
 
 if __name__=='__main__': unittest.main()
