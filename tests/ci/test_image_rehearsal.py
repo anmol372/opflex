@@ -111,6 +111,16 @@ class ImageRehearsal(unittest.TestCase):
         self.assertEqual(args[args.index('--branch')+1], 'anmrasto/gha-rehearsal-1.2.3.4')
         self.assertNotIn('https://github.com/noironetworks/cicd-status.git', args)
 
+    def test_build_log_is_staged_outside_source_archive_and_retained_on_failure(self):
+        step = next(step for step in self.steps if step.get('id') == 'build')
+        helper = 'cicd/travis/build-push-opflex-images.sh'
+        result, files = self.run_script(step['run'], binaries={helper:
+            'test ! -e "${CI_ARTIFACT_DIR}/build-and-publish.log"\n'
+            'printf "%s\\n" "fixture build output"\n'
+            'exit 77\n'})
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertEqual(files['ci-artifacts/build-and-publish.log'], 'fixture build output\n')
+
     def test_actual_evidence_keeps_manual_source_identity_without_fake_tag(self):
         result, files = self.run_script(self.step('Prepare immutable image evidence')['run'],
             binaries={'python3': 'printf "%s\\n" "$@" > "$FIXTURE_ARGS"\n'}, metadata=True)

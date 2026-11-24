@@ -211,8 +211,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "${CI_ARTIFACT_DIR}"
+          build_log="${RUNNER_TEMP}/opflex-build-and-publish.log"
+          trap 'if [[ -f "${build_log}" ]]; then cp -- "${build_log}" "${CI_ARTIFACT_DIR}/build-and-publish.log"; fi' EXIT
           SKIP_CICD_STATUS=true "${CICD_DIR}/travis/build-push-opflex-images.sh" \
-            2>&1 | tee "${CI_ARTIFACT_DIR}/build-and-publish.log"
+            2>&1 | tee "${build_log}"
 
       - name: Retain explicit base output receipt
         if: steps.build.outcome == 'success' && needs.resolve.outputs.operation == 'base'
