@@ -7,18 +7,15 @@ on:
       - "**"
     tags:
       - "[0-9]+.[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+.[0-9]+-opflex-build-base"
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ startsWith(github.ref, 'refs/tags/') && format('opflex-release-{0}', github.ref) || format('opflex-tests-{0}', github.event.pull_request.number || github.ref) }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
-
 env:
   SOURCE_BRANCH: ${{ vars.SOURCE_BRANCH || 'master' }}
   UPSTREAM_ID: ${{ vars.UPSTREAM_ID }}
-  CICD_COMMIT: 3b1d73b4f0518c7f28ac81d4ebc58869b6c52786
+  CICD_COMMIT: 85588e18814883cba3a4e7b57fe896c08b7d7dff
   SKIP_CICD_STATUS: ${{ vars.SKIP_CICD_STATUS || 'true' }}
   GHA_PLATFORM: linux/amd64
   DOCKER_BUILDKIT: "1"
@@ -31,6 +28,9 @@ jobs:
        (github.event_name == 'push' &&
         github.event.deleted == false &&
         startsWith(github.ref, 'refs/heads/')))
+    concurrency:
+      group: ${{ format('opflex-tests-{0}', github.event.pull_request.number || github.ref) }}
+      cancel-in-progress: true
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -125,12 +125,17 @@ jobs:
 
   validate-source:
     name: Validate release tag
+    env:
+      EXPECTED_OPFLEX_BASE_DIGEST: ${{ vars.MASTER_OPFLEX_BASE_DIGEST }}
     if: github.event_name == 'push' && github.event.deleted == false && github.repository == 'noironetworks/opflex' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
       opflex-commit: ${{ steps.source.outputs.opflex_commit }}
       date-tag: ${{ steps.source.outputs.date_tag }}
+      release-tag: ${{ steps.source.outputs.release_tag }}
+      operation: ${{ steps.source.outputs.operation }}
+      base-digest: ${{ steps.source.outputs.base_digest }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -144,7 +149,13 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+          release_tag="${GITHUB_REF_NAME}"
+          operation=runtime
+          if [[ "${release_tag}" == *-opflex-build-base ]]; then
+            operation=base
+            release_tag="${release_tag%-opflex-build-base}"
+          fi
+          [[ "${release_tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "::error::Release tag must have form N.N.N.N"; exit 1;
           }
           [[ "${UPSTREAM_ID}" =~ ^[0-9a-f]+$ ]] || {
@@ -166,13 +177,24 @@ jobs:
           [[ "${commit}" == "$(git rev-parse "refs/remotes/origin/${SOURCE_BRANCH}")" ]] || {
             echo "::error::Release tag must point to current ${SOURCE_BRANCH} head"; exit 1;
           }
+          if [[ "${operation}" == runtime ]]; then
+            [[ "${EXPECTED_OPFLEX_BASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo '::error::Runtime requires the approved existing base digest'; exit 1;
+            }
+          fi
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "operation=${operation}" >> "${GITHUB_OUTPUT}"
+          echo "base_digest=${EXPECTED_OPFLEX_BASE_DIGEST}" >> "${GITHUB_OUTPUT}"
           echo "opflex_commit=${commit}" >> "${GITHUB_OUTPUT}"
           echo "date_tag=$(date -u +%m%d%y)" >> "${GITHUB_OUTPUT}"
 
   build-base:
     name: Build and publish opflex-build-base
-    needs:
-      - validate-source
+    needs: [validate-source]
+    if: needs.validate-source.outputs.operation == 'base'
+    concurrency:
+      group: ${{ format('opflex-base-{0}', needs.validate-source.outputs.release-tag) }}
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     outputs:
@@ -180,7 +202,7 @@ jobs:
       cicd-commit: ${{ steps.cicd.outputs.cicd_commit }}
     env:
       TRAVIS_COMMIT: ${{ needs.validate-source.outputs.opflex-commit }}
-      TRAVIS_TAG: ${{ github.ref_name }}
+      TRAVIS_TAG: ${{ needs.validate-source.outputs.release-tag }}
       TRAVIS_BUILD_NUMBER: ${{ github.run_number }}
       TRAVIS_REPO_SLUG: ${{ github.repository }}
       GHA_TRIGGER_TAG: ${{ github.ref_name }}
@@ -277,22 +299,23 @@ jobs:
 
   build-runtime:
     name: Build and publish opflex-build and opflex
-    needs:
-      - validate-source
-      - build-base
+    needs: [validate-source]
+    if: needs.validate-source.outputs.operation == 'runtime'
+    concurrency:
+      group: ${{ format('opflex-runtime-{0}', needs.validate-source.outputs.release-tag) }}
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
       TRAVIS_COMMIT: ${{ needs.validate-source.outputs.opflex-commit }}
-      TRAVIS_TAG: ${{ github.ref_name }}
+      TRAVIS_TAG: ${{ needs.validate-source.outputs.release-tag }}
       TRAVIS_BUILD_NUMBER: ${{ github.run_number }}
       TRAVIS_REPO_SLUG: ${{ github.repository }}
       TRAVIS_JOB_WEB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       GHA_TRIGGER_TAG: ${{ github.ref_name }}
       GHA_DATE_TAG: ${{ needs.validate-source.outputs.date-tag }}
       GHA_OPFLEX_BUILD_PHASE: runtime
-      EXPECTED_OPFLEX_BASE_DIGEST: ${{ needs.build-base.outputs.quay-digest }}
-      CICD_COMMIT: ${{ needs.build-base.outputs.cicd-commit }}
+      EXPECTED_OPFLEX_BASE_DIGEST: ${{ needs.validate-source.outputs.base-digest }}
       CI_ARTIFACT_DIR: ci-artifacts
       CI_EVIDENCE_MODE: prepared-v1
       CI_SCAN_POLICY: advisory
@@ -312,7 +335,7 @@ jobs:
           cache: maven
           cache-dependency-path: genie/pom.xml
 
-      - name: Install status dependencies and clone the base job's CICD scripts
+      - name: Install status dependencies and clone reviewed CICD scripts
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -324,7 +347,7 @@ jobs:
           git -C "${cicd_dir}" fetch --depth=1 origin "${CICD_COMMIT}"
           git -C "${cicd_dir}" checkout --quiet --detach FETCH_HEAD
           [[ "$(git -C "${cicd_dir}" rev-parse HEAD)" == "${CICD_COMMIT}" ]] || {
-            echo "::error::Runtime CICD checkout does not match the base job"; exit 1;
+            echo "::error::Runtime CICD checkout does not match the reviewed pin"; exit 1;
           }
           {
             echo "CICD_DIR=${cicd_dir}"

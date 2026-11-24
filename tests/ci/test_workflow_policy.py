@@ -119,16 +119,23 @@ class WorkflowPolicy(unittest.TestCase):
             self.assertEqual(self.selected(entry, self.context(event, ref, canonical, deleted)), expected)
         if self.repo == 'opflex':
             ctx = self.context(ref='refs/tags/6.1.1.8')
-            for source, base, expected in [('success', 'success', True), ('failure', 'success', False), ('success', 'failure', False), ('success', 'skipped', False)]:
-                ctx['needs'] = {'validate-source': {'result': source}, 'build-base': {'result': base}}
-                self.assertEqual(self.selected(jobs['build-runtime'], ctx), expected)
+            for source, operation, expected_runtime, expected_base in [
+                ('success', 'runtime', True, False), ('success', 'base', False, True),
+                ('failure', 'runtime', False, False)]:
+                ctx['needs'] = {'validate-source': {'result': source, 'outputs': {'operation': operation}}}
+                self.assertEqual(self.selected(jobs['build-runtime'], ctx), expected_runtime)
+                self.assertEqual(self.selected(jobs['build-base'], ctx), expected_base)
+            self.assertEqual(jobs['build-runtime']['needs'], ['validate-source'])
 
     def test_release_not_cancelled_and_tests_cancelled(self):
         if not self.workflow:
             return
-        if self.repo == 'acc-provision':
-            self.assertTrue(self.workflow['jobs']['run-unit-tests']['concurrency']['cancel-in-progress'])
-            self.assertFalse(self.workflow['jobs']['build-and-publish']['concurrency']['cancel-in-progress'])
+        if self.repo in {'acc-provision', 'opflex'}:
+            unit = 'unit-tests' if self.repo == 'opflex' else 'run-unit-tests'
+            self.assertTrue(self.workflow['jobs'][unit]['concurrency']['cancel-in-progress'])
+            publications = ['build-base', 'build-runtime'] if self.repo == 'opflex' else ['build-and-publish']
+            for publication in publications:
+                self.assertFalse(self.workflow['jobs'][publication]['concurrency']['cancel-in-progress'])
         else:
             policy = self.workflow['concurrency']['cancel-in-progress']
             self.assertTrue(evaluate(policy, self.context()))
@@ -170,12 +177,13 @@ esac
             for tag, kind, head, source, expected in [
                 ('6.1.1.8', 'tag', 'a'*40, 'a'*40, True),
                 ('bad', 'tag', 'a'*40, 'a'*40, False),
-                ('6.1.1.8-opflex-build-base', 'tag', 'a'*40, 'a'*40, False),
+                ('6.1.1.8-opflex-build-base', 'tag', 'a'*40, 'a'*40, True),
                 ('6.1.1.8', 'commit', 'a'*40, 'a'*40, False),
                 ('6.1.1.8', 'tag', 'b'*40, 'a'*40, False),
                 ('6.1.1.8', 'tag', 'a'*40, 'b'*40, False),
             ]:
                 env = {**os.environ, 'PATH': directory + os.pathsep + os.environ['PATH'], 'GITHUB_REF_NAME': tag,
+                       'EXPECTED_OPFLEX_BASE_DIGEST': 'sha256:' + 'b'*64,
                        'UPSTREAM_ID': '81c2369', 'SKIP_CICD_STATUS': 'false', 'SOURCE_BRANCH': 'fixture-branch',
                        'SAFE_TAG': tag, 'GITHUB_ENV': directory + '/env', 'GITHUB_OUTPUT': directory + '/out',
                        'GITHUB_RUN_NUMBER': '123', 'GITHUB_REPOSITORY': f'noironetworks/{self.repo}',
