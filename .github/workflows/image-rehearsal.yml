@@ -82,7 +82,7 @@ jobs:
             ref="refs/heads/${branch}"
           fi
           git init --quiet "${RUNNER_TEMP}/cicd"
-          git -C "${RUNNER_TEMP}/cicd" remote add origin https://github.com/noironetworks/cicd.git
+          git -C "${RUNNER_TEMP}/cicd" remote add origin https://github.com/anmol372/cicd.git
           git -C "${RUNNER_TEMP}/cicd" fetch --depth=1 --no-tags origin "${ref}"
           git -C "${RUNNER_TEMP}/cicd" checkout --quiet --detach FETCH_HEAD
           commit="$(git -C "${RUNNER_TEMP}/cicd" rev-parse HEAD)"
@@ -180,7 +180,7 @@ jobs:
           cicd_dir="${RUNNER_TEMP}/cicd"
           [[ "${CICD_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid reviewed CICD SHA"; exit 1; }
           git init --quiet "${cicd_dir}"
-          git -C "${cicd_dir}" remote add origin https://github.com/noironetworks/cicd.git
+          git -C "${cicd_dir}" remote add origin https://github.com/anmol372/cicd.git
           git -C "${cicd_dir}" fetch --depth=1 origin "${CICD_COMMIT}"
           git -C "${cicd_dir}" checkout --quiet --detach FETCH_HEAD
           [[ "$(git -C "${cicd_dir}" rev-parse HEAD)" == "${CICD_COMMIT}" ]] || {
