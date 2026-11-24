@@ -48,11 +48,16 @@ fi
 set -Eeuxo pipefail
 if [[ "${BUILD_BASE}" == true ]]; then
     echo "starting opflex-base build"
-    docker build $BUILDARG $SECOPT -t $DOCKER_HUB_ID/opflex-build-base:$DOCKER_TAG -f $DOCKER_DIR/Dockerfile-opflex-build-base . &> /tmp/opflex-build-base.log &
-    while [ ! -f  /tmp/opflex-build-base.log ]; do sleep 10; done
-    tail -f /tmp/opflex-build-base.log | awk 'NR%100-1==0' &
-    #while [[ "$(docker images -q $DOCKER_HUB_ID/opflex-build-base:$DOCKER_TAG 2> /dev/null)" == ""]] && [[ "$(pgrep -x 'docker' 2> /dev/null)" != '' ]]; do sleep 60; done
-    while [[ "$(pgrep -x 'docker' 2> /dev/null)" != '' ]]; do sleep 60; done
+    base_build=(docker build $BUILDARG $SECOPT -t "$DOCKER_HUB_ID/opflex-build-base:$DOCKER_TAG"
+        -f "$DOCKER_DIR/Dockerfile-opflex-build-base" .)
+    if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+        "${base_build[@]}"
+    else
+        "${base_build[@]}" &> /tmp/opflex-build-base.log &
+        while [ ! -f /tmp/opflex-build-base.log ]; do sleep 10; done
+        tail -f /tmp/opflex-build-base.log | awk 'NR%100-1==0' &
+        while [[ "$(pgrep -x 'docker' 2> /dev/null)" != '' ]]; do sleep 60; done
+    fi
 else
     echo "starting opflex build"
     #docker push $DOCKER_HUB_ID/opflex-build-base:$DOCKER_TAG
@@ -109,14 +114,17 @@ else
     cp opflex.tgz opflex/
     popd
 
-    docker build $BUILDARG ${OPFLEX_BASE_BUILD_ARGS[@]+"${OPFLEX_BASE_BUILD_ARGS[@]}"} --build-arg DOCKER_HUB_ID=$DOCKER_HUB_ID --build-arg DOCKER_TAG=$DOCKER_TAG $SECOPT -t $DOCKER_HUB_ID/opflex-build:$DOCKER_TAG -f $DOCKER_DIR/Dockerfile-opflex-build $OPFLEX_DIR &> /tmp/opflex-build.log &
-    #docker build $SECOPT -t $DOCKER_HUB_ID/opflex-build:$DOCKER_TAG -f $DOCKER_DIR/Dockerfile-opflex-build $OPFLEX_DIR
-    ##docker push $DOCKER_HUB_ID/opflex-build$DOCKER_TAG
-    while [ ! -f  /tmp/opflex-build.log ]; do sleep 10; done
-    tail -f /tmp/opflex-build.log | awk 'NR%100-1==0' &
-
-    #while [[ "$(docker images -q $DOCKER_HUB_ID/opflex-build:$DOCKER_TAG 2> /dev/null)" == ""]] && [[ "$(pgrep -x 'docker' 2> /dev/null)" != "" ]]; do sleep 60; done
-    while [[ "$(pgrep -x 'docker' 2> /dev/null)" != '' ]]; do sleep 60; tail -n 2 /tmp/opflex-build.log; done
+    runtime_build=(docker build $BUILDARG ${OPFLEX_BASE_BUILD_ARGS[@]+"${OPFLEX_BASE_BUILD_ARGS[@]}"}
+        --build-arg "DOCKER_HUB_ID=$DOCKER_HUB_ID" --build-arg "DOCKER_TAG=$DOCKER_TAG" $SECOPT
+        -t "$DOCKER_HUB_ID/opflex-build:$DOCKER_TAG" -f "$DOCKER_DIR/Dockerfile-opflex-build" "$OPFLEX_DIR")
+    if [[ "${CI_REHEARSAL:-}" == 1 ]]; then
+        "${runtime_build[@]}"
+    else
+        "${runtime_build[@]}" &> /tmp/opflex-build.log &
+        while [ ! -f /tmp/opflex-build.log ]; do sleep 10; done
+        tail -f /tmp/opflex-build.log | awk 'NR%100-1==0' &
+        while [[ "$(pgrep -x 'docker' 2> /dev/null)" != '' ]]; do sleep 60; tail -n 2 /tmp/opflex-build.log; done
+    fi
 
     ################## Copy everything from build into host ###############
     rm -Rf build/opflex/dist

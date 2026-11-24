@@ -45,6 +45,8 @@ if name == 'docker':
                 data['resolved_base_digest'] = data['resolved_from'].split('@', 1)[1] if '@' in data['resolved_from'] else os.environ['FIXTURE_TAG_AT_BUILD_DIGEST']
                 break
     record(**data)
+    if args and args[0] == 'build' and os.environ.get('FIXTURE_BUILD_FAILURE'):
+        raise SystemExit(int(os.environ['FIXTURE_BUILD_FAILURE']))
     if args[:2] == ['image', 'inspect']:
         print(os.environ.get('FIXTURE_REPODIGESTS', os.environ['FIXTURE_HUB'] + '/opflex-build-base@' + os.environ['FIXTURE_ACTUAL_DIGEST']))
     elif args and args[0] == 'create': print('fixture-container')
@@ -58,11 +60,13 @@ elif name == 'tar':
             target = pathlib.Path(args[args.index('-C')+1]); (target/'bin').mkdir(parents=True, exist_ok=True)
     else: sys.stdin.buffer.read()
 elif name == 'pgrep':
+    record(argv=args)
     time.sleep(0.02)
     result = subprocess.run(['/usr/bin/pgrep', '-f', re.escape(str(pathlib.Path(sys.argv[0]).with_name('docker'))) + r' build'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     sys.stdout.buffer.write(result.stdout); raise SystemExit(result.returncode)
 elif name == 'sleep': time.sleep(0.005)
 # tail intentionally exits; no background reader survives the fixture.
+elif name == 'tail': record(argv=args)
 '''
 
 
@@ -94,8 +98,8 @@ class ApprovedBaseInput(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def invoke(self, expected=0):
-        result = subprocess.run(['bash', 'docker/travis/build-opflex-travis.sh', HUB, TAG, ''],
+    def invoke(self, expected=0, build_args=''):
+        result = subprocess.run(['bash', 'docker/travis/build-opflex-travis.sh', HUB, TAG, build_args],
             cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=15)
         if expected == 0: self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else: self.assertNotEqual(result.returncode, 0)
@@ -158,6 +162,28 @@ class ApprovedBaseInput(unittest.TestCase):
         self.assertEqual(len(builds),1)
         self.assertTrue(builds[0]['argv'][builds[0]['argv'].index('-f')+1].endswith('/Dockerfile-opflex-build-base'))
         self.assertFalse(any(item['tool']=='mvn' for item in calls))
+
+    def test_rehearsal_build_preserves_inputs_and_propagates_docker_failure(self):
+        self.env.update(CI_REHEARSAL='1', FIXTURE_BUILD_FAILURE='77')
+        for phase, image in (('base', 'opflex-build-base'), ('runtime', 'opflex-build')):
+            with self.subTest(phase=phase):
+                if self.log.exists():
+                    self.log.unlink()
+                self.env['GHA_OPFLEX_BUILD_PHASE'] = phase
+                label = '--label=quay.expires-after=6h'
+                result = self.invoke(expected=77, build_args=label)
+                self.assertEqual(result.returncode, 77)
+                calls = self.commands()
+                self.assertFalse(any(item['tool'] in ('pgrep', 'tail') for item in calls))
+                builds = [item for item in calls if item['tool'] == 'docker' and item['argv'][0] == 'build']
+                self.assertEqual(len(builds), 1)
+                expected_args = ['build', label]
+                if phase == 'runtime':
+                    base = f'{HUB}/opflex-build-base@{A}'
+                    expected_args += ['--build-arg', f'OPFLEX_BUILD_BASE_IMAGE={base}',
+                                      '--build-arg', f'DOCKER_HUB_ID={HUB}', '--build-arg', f'DOCKER_TAG={TAG}']
+                expected_args += ['-t', f'{HUB}/{image}:{TAG}', '-f', f'docker/travis/Dockerfile-{image}', '.']
+                self.assertEqual(builds[0]['argv'], expected_args)
 
     def test_runtime_selects_matching_repository_digest_after_unrelated_cached_entry(self):
         self.env['FIXTURE_REPODIGESTS']='example.test/cached/base@'+B+'\n'+HUB+'/opflex-build-base@'+A
