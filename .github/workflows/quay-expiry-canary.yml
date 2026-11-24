@@ -1,0 +1,180 @@
+name: Hosted Quay expiry canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    if: github.repository == 'anmol372/opflex' && github.ref == 'refs/heads/anmrasto/gha-rehearsal-20261119'
+    runs-on: ubuntu-24.04
+    environment: gha-rehearsal
+    timeout-minutes: 10
+    env:
+      CI_REHEARSAL: '1'
+      CICD_COMMIT: 508cdc562f2ae11b0aab5b2a380285e4b43d936a
+    steps:
+      - name: Fetch the reviewed helper and build the canary image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          helper="${RUNNER_TEMP}/cicd"
+          git init --quiet "${helper}"
+          git -C "${helper}" fetch --no-tags --depth=1 https://github.com/anmol372/cicd.git "${CICD_COMMIT}"
+          git -C "${helper}" checkout --quiet --detach FETCH_HEAD
+          [[ "$(git -C "${helper}" rev-parse HEAD)" == "${CICD_COMMIT}" ]]
+          context="${RUNNER_TEMP}/canary-context"
+          mkdir -p "${context}"
+          printf 'Hosted expiry canary %s-%s\n' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" > "${context}/marker.txt"
+          cat > "${context}/Dockerfile" <<'DOCKERFILE'
+          FROM scratch
+          LABEL quay.expires-after="6h"
+          COPY marker.txt /marker.txt
+          DOCKERFILE
+          docker build --provenance=false --platform linux/amd64 --load --tag rehearsal-canary:local "${context}"
+
+      - name: Push distinct personal test tags and retain expiry readback
+        shell: bash
+        env:
+          CI_QUAY_USERNAME: ${{ secrets.QUAY_REHEARSAL_USERNAME }}
+          CI_QUAY_TOKEN: ${{ secrets.QUAY_REHEARSAL_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          : "${CI_QUAY_USERNAME:?}" "${CI_QUAY_TOKEN:?}"
+          export DOCKER_CONFIG="$(mktemp -d "${RUNNER_TEMP}/quay-auth.XXXXXXXX")"
+          trap 'rm -rf -- "${DOCKER_CONFIG}"' EXIT
+          printf '%s' "${CI_QUAY_TOKEN}" | docker login quay.io --username "${CI_QUAY_USERNAME}" --password-stdin
+          export PYTHONPATH="${RUNNER_TEMP}/cicd/travis"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import time
+
+          import rehearsal_quay as quay
+
+          tag = f"gha-expiry-hosted-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+          targets = (
+              f"quay.io/anmrasto/opflex-build:{tag}",
+              f"quay.io/anmrasto/opflex-build:{tag}-alias",
+              f"quay.io/anmrasto/opflex-build-base:{tag}-copy",
+          )
+          artifact = Path("quay-expiry-hosted.json")
+          receipt = {
+              "cicd_sha": os.environ["CICD_COMMIT"],
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "tags": [],
+              "cleanup": [],
+          }
+
+          def save():
+              artifact.write_text(json.dumps(receipt, indent=2) + "\n")
+
+          def docker(*args):
+              result = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=90)
+              if result.returncode:
+                  raise RuntimeError(f"Docker {args[0]} failed with exit {result.returncode}")
+              return result.stdout
+
+          # Exercise the helper without attempting API writes with a registry robot.
+          request = quay.request
+          def read_only(path, data=None):
+              if data is not None:
+                  raise ValueError("Canary checks automatic expiry using readback only")
+              return request(path)
+          quay.request = read_only
+
+          def require_six_hours(ref, digest, *, created):
+              expiry = quay.verify_expiry(ref, digest, created=created)
+              current = quay.current_tag(ref)
+              if (not current or current.get("manifest_digest") != digest
+                      or current.get("end_ts") != expiry
+                      or expiry - current["start_ts"] != 21600):
+                  raise ValueError("Tag does not have exactly six hours of verified expiry")
+              return expiry
+
+          save()
+          expected_digest = None
+          source = "rehearsal-canary:local"
+          try:
+              for ref in targets:
+                  if quay.current_tag(ref) is not None:
+                      raise ValueError(f"Test tag already exists: {ref}")
+              for ref in targets:
+                  row = {"reference": ref, "status": "attempted"}
+                  receipt["tags"].append(row)
+                  receipt["cleanup"].append(ref)
+                  save()
+                  docker("tag", source, ref)
+                  result = docker("push", ref)
+                  digests = re.findall(r"\bdigest: (sha256:[0-9a-f]{64})\b", result)
+                  if len(digests) != 1:
+                      raise ValueError(f"Push did not identify a single digest: {ref}")
+                  digest = digests[0]
+                  if expected_digest is None:
+                      expected_digest = digest
+                      primary_repo = ref.rsplit(":", 1)[0]
+                      source = f"{primary_repo}@{digest}"
+                      manifest = json.loads(docker("buildx", "imagetools", "inspect", "--raw", source))
+                      receipt["media_type"] = manifest["mediaType"]
+                      if manifest["mediaType"] != "application/vnd.docker.distribution.manifest.v2+json":
+                          raise ValueError("Canary must test a Docker schema 2 single image manifest")
+                      docker("pull", "--platform", "linux/amd64", source)
+                  if digest != expected_digest:
+                      raise ValueError(f"Tag digest differs from primary: {ref}")
+                  row["digest"] = digest
+                  current = None
+                  for delay in (0, 1, 2):
+                      if delay:
+                          time.sleep(delay)
+                      current = quay.current_tag(ref)
+                      if current:
+                          break
+                  if not current or current.get("manifest_digest") != digest:
+                      raise ValueError(f"Cannot verify the current registry tag digest: {ref}")
+                  row["start_ts"] = current.get("start_ts")
+                  row["end_ts"] = current.get("end_ts")
+                  try:
+                      row["expiry"] = require_six_hours(ref, digest, created=True)
+                  except (OSError, ValueError, KeyError, TypeError):
+                      row["status"] = "expiry_not_verified"
+                  else:
+                      row["status"] = "verified"
+                      receipt["cleanup"].remove(ref)
+                  save()
+              primary = receipt["tags"][0]
+              if primary["status"] == "verified":
+                  try:
+                      retry = require_six_hours(primary["reference"], primary["digest"], created=False)
+                      if retry != primary["expiry"]:
+                          raise ValueError("Primary expiry changed on readback")
+                      receipt["same_tag_readback"] = True
+                  except (OSError, ValueError, KeyError, TypeError):
+                      receipt["same_tag_readback"] = False
+                      receipt["cleanup"].append(primary["reference"])
+              receipt["canary_complete"] = True
+              receipt["six_hour_expiry_verified"] = not receipt["cleanup"]
+          finally:
+              save()
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                  for row in receipt["tags"]:
+                      summary.write(f"- `{row['reference']}` {row['status']}\n")
+                  if receipt["cleanup"]:
+                      summary.write("\nReview these attempted tags for cleanup if present.\n")
+                      for ref in receipt["cleanup"]:
+                          summary.write(f"- `{ref}`\n")
+          PY
+
+      - name: Retain the canary receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quay-expiry-hosted
+          path: quay-expiry-hosted.json
+          if-no-files-found: ignore

@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       stream:
-        description: Release stream (destination remains private rehearsal)
+        description: Release stream in the personal rehearsal namespace
         required: true
         default: z
         type: choice
@@ -67,7 +67,7 @@ jobs:
         shell: bash
         env:
           REQUESTED_CICD_REF: ${{ inputs.cicd_ref }}
-          REVIEWED_CICD_DEFAULT: 85588e18814883cba3a4e7b57fe896c08b7d7dff
+          REVIEWED_CICD_DEFAULT: 508cdc562f2ae11b0aab5b2a380285e4b43d936a
         run: |
           set -Eeuo pipefail
           requested="${REQUESTED_CICD_REF:-${REVIEWED_CICD_DEFAULT}}"
@@ -134,7 +134,6 @@ jobs:
       CICD_COMMIT: ${{ needs.resolve.outputs.cicd-commit }}
       SELECTED_SOURCE_REF: ${{ needs.resolve.outputs.source-ref }}
       EXPECTED_OPFLEX_BASE_DIGEST: ${{ needs.resolve.outputs.base-digest }}
-      SKIP_CICD_STATUS: "false"
       CI_ARTIFACT_DIR: ci-artifacts
       CI_EVIDENCE_MODE: prepared-v1
       CI_SCAN_POLICY: advisory
@@ -264,7 +263,7 @@ jobs:
           echo "prepared=true" >> "${GITHUB_OUTPUT}"
 
       - name: Publish prepared image status
-        if: ${{ always() && env.SKIP_CICD_STATUS == 'false' && steps.evidence.outputs.prepared == 'true' }}
+        if: ${{ always() && vars.REHEARSAL_PUBLISH_STATUS == 'true' && steps.evidence.outputs.prepared == 'true' }}
         shell: bash
         env:
           TRAVIS_TAGGER: ${{ secrets.TEST_CICD_STATUS_TOKEN }}
